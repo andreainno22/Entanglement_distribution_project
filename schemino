@@ -1,0 +1,59 @@
+
+Perfetto, ecco lo schemino operativo del tuo caso dumbbell.
+
+Oggetti (struct)
+
+EntanglerProt(sim, net, u, v; ...):
+Generatore di coppie Bell su un link fisico u-v.
+
+SwapperProt(sim, net, node; ...):
+Repeater che cerca due entanglement compatibili e fa BSM/swap.
+
+EntanglementTracker(sim, net, node):
+Ascolta messaggi di update e aggiorna tag/correzioni.
+
+app_process(...):
+Consumer applicativo che chiede A-C o B-D.
+
+Attivazione (processi):
+
+@process ent() per ogni link.
+@process swap_r1() e @process swap_r2().
+@process tracker() su ogni nodo.
+@process app_process(...) per i due flussi.
+run(sim, T) fa avanzare tutti insieme.
+
+Timeline semplificata:
+
+t=0
+Partono tutti i processi. Entangler prova a lockare due slot liberi sui due estremi del link.
+t=0+
+Entangler fa tentativi (tempo tentativo + probabilità successo). Se successo:
+scrive stato Bell negli slot
+aggiunge tag EntanglementCounterpart(remote_node, remote_slot) su entrambi.
+t=...
+Swapper su R1/R2 trova una coppia “sinistra/destra” swappabile, locka slot, esegue swap.
+Subito dopo swap
+Swapper invia messaggi di update/correzione (X/Z frame) ai nodi coinvolti.
+t=...
+EntanglementTracker riceve i messaggi e aggiorna i tag: i counterpart cambiano da “link locale” a “endpoint più lontano”.
+t=... (arriva richiesta app, Poisson)
+app_process fa:
+query su A (o B) per trovare counterpart verso C (o D)
+verifica reciproca su C (o D)
+lock di entrambi
+misura fedeltà
+traceout! per consumare la coppia
+unlock.
+Ripete fino a t=T.
+Chi fa cosa (in una riga)
+
+Entangler: crea entanglement link-level.
+Swapper: allunga l’entanglement facendo swap.
+Tracker: mantiene coerenza metadata + correzioni.
+App: consuma solo quando esiste coppia end-to-end valida.
+Perché vedi pochi pair quando qualcosa non va
+
+Entangler può saturare memorie e bloccare altri protocolli.
+Swapper può scegliere candidati non utili ai flussi target.
+Tracker/lock contention può causare finestre transitorie in cui la query fallisce.
