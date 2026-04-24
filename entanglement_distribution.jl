@@ -1,10 +1,10 @@
 # ================================================================
 # Assignment 4 - Part 1: Entanglement Distribution
-# Dumbbell Quantum Network Simulation (ProtocolZoo-based implementation)
+# Quantum Network Simulation
 # ================================================================
 #
-# This script implements the dumbbell topology using QuantumSavory's
-# high-level ProtocolZoo components:
+# This script implements the topology using QuantumSavory's
+# with ProtocolZoo components:
 # - EntanglerProt for link-level Bell-pair generation
 # - SwapperProt for repeater-side entanglement swapping
 # - EntanglementTracker to propagate swap updates/corrections
@@ -12,6 +12,8 @@
 # Then, an application process (Poisson requests) consumes end-to-end pairs
 # on A-C and B-D and records the resulting fidelity.
 # ================================================================
+
+#todo: fare test sia con Purging delle coppie sia senza, vedere come cambia throughput, fidelities, numero di coppie totali generate. 
 
 using ConcurrentSim
 using ResumableFunctions
@@ -41,7 +43,7 @@ const P_DEPOL = 0.02
 const T2 = 0.5
 
 # Memory slots (qubits) per node.
-const N_MEM = 50
+const N_MEM = 5
 
 # Application-layer request arrival rate [requests/s] for each flow.
 # We instantiate one process for A-C and one for B-D.
@@ -49,7 +51,7 @@ const APP_RATE = 0.47 * BELL_RATE
 
 # Maximum time a request waits for a target end-to-end pair.
 # Inf means blocking wait until a pair appears.
-const APP_MAX_WAIT = 0.001
+const APP_MAX_WAIT = Inf
 
 # Polling step used while waiting for a target pair.
 const APP_WAIT_POLL_DT = 1e-3
@@ -176,13 +178,13 @@ end
 # ================================================================
 
 """
-    app_process(sim, net, nodeA, nodeB, label, fids, rng)
+    app_process(sim, net, node_query, node_target, label, fids, rng)
 
-Poisson request process for one end-to-end pair between `nodeA` and `nodeB`.
+Poisson request process for one end-to-end pair between `node_query` (A or B) and `node_target` (C or D).
 
 Behavior per request:
-1. Query for one available tagged pair (EntanglementCounterpart) on A side.
-2. Verify reciprocal tag on B side.
+1. Query for one available tagged pair (EntanglementCounterpart) on the query side.
+2. Verify reciprocal tag on the target side.
 3. Lock both slots, re-check and remove tags atomically.
 4. Measure fidelity F = <Phi+|rho|Phi+>.
 5. Store F in `fids` and consume pair via traceout!.
@@ -191,30 +193,31 @@ If no pair is ready, the request is considered not served.
 """
 @resumable function app_process(sim::Simulation,
                                 net::RegisterNet,
-                                nodeA::Int,
-                                nodeB::Int,
                                 label::String,
-                                fids::Vector{Float64},
-                                rng::AbstractRNG,
+                                node_query::Int,
+                                node_target::Int,
+                                target_fids::Vector{Float64},
+                                rng_poisson::AbstractRNG,
                                 counters::Union{Nothing,Dict{Symbol, Int}}=nothing,
-                                delivered_key::Symbol=:delivered,
-                                request_key::Symbol=:requests,
-                                ready_key::Symbol=:ready,
-                                miss_no_pair_key::Symbol=:miss_no_pair,
-                                miss_unsynced_key::Symbol=:miss_unsynced,
-                                miss_changed_key::Symbol=:miss_changed,
-                                max_wait::Float64=APP_MAX_WAIT,
-                                wait_poll_dt::Float64=APP_WAIT_POLL_DT,
                                 app_logs::Bool=false)
     # Exponential inter-arrivals -> Poisson request stream.
-    dist = Exponential(1.0 / APP_RATE)
+    dist = Exponential(1.0 / (APP_RATE/2)) # MOD: divide by 2 because we have two independent processes generating requests at the same rate
 
     while true
         # Wait for next request arrival.
-        @yield timeout(sim, rand(rng, dist))
-        isnothing(counters) || (counters[request_key] += 1)
+        @yield timeout(sim, rand(rng_poisson, dist))
         req_t0 = now(sim)
         t = req_t0
+
+        if label == "A-C"
+            counter_suffix = :AC
+        else
+            counter_suffix = :BD
+        end
+        
+        
+        isnothing(counters) || (counters[Symbol("requests_$counter_suffix")] += 1)
+
         app_logs && @info("[t=$(round(t, digits=3))s] APP REQUEST [$label]")
 
         # Wait (possibly indefinitely) until a consistent target pair is available.
@@ -223,10 +226,10 @@ If no pair is ready, the request is considered not served.
         saw_candidate_without_reciprocal = false
         while true
             # Query one local slot currently tagged as entangled with nodeB.
-            q1 = query(net[nodeA], EntanglementCounterpart, nodeB, ❓; locked=false, assigned=true)
+            q1 = query(net[node_query], EntanglementCounterpart, node_target, ❓; locked=false, assigned=true)
             if !isnothing(q1)
                 # Query the reciprocal metadata on nodeB.
-                q2 = query(net[nodeB], EntanglementCounterpart, nodeA, q1.slot.idx; locked=false, assigned=true)
+                q2 = query(net[node_target], EntanglementCounterpart, node_query, q1.slot.idx; locked=false, assigned=true)
                 if !isnothing(q2)
                     break
                 end
@@ -234,12 +237,12 @@ If no pair is ready, the request is considered not served.
             end
 
             waited = now(sim) - req_t0
-            if waited >= max_wait
+            if waited >= APP_MAX_WAIT
                 if saw_candidate_without_reciprocal
-                    isnothing(counters) || (counters[miss_unsynced_key] += 1)
+                    isnothing(counters) || (counters[Symbol("miss_unsynced_$counter_suffix")] += 1)
                     app_logs && @info("  -> [$label] Waited $(round(waited, digits=4))s; counterpart metadata still unsynchronized.")
                 else
-                    isnothing(counters) || (counters[miss_no_pair_key] += 1)
+                    isnothing(counters) || (counters[Symbol("miss_no_pair_$counter_suffix")] += 1)
                     app_logs && @info("  -> [$label] Waited $(round(waited, digits=4))s; no target pair became available.")
                 end
                 q1 = nothing
@@ -248,11 +251,11 @@ If no pair is ready, the request is considered not served.
             end
 
             # Event-driven wait: wake up when tags change on either endpoint.
-            tag_change_evt = QuantumSavory.onchange_tag(net[nodeA]) | QuantumSavory.onchange_tag(net[nodeB])
-            if isinf(max_wait)
+            tag_change_evt = QuantumSavory.onchange_tag(net[node_query]) | QuantumSavory.onchange_tag(net[node_target])
+            if isinf(APP_MAX_WAIT)
                 @yield tag_change_evt
             else
-                @yield tag_change_evt | timeout(sim, max_wait - waited)
+                @yield tag_change_evt | timeout(sim, APP_MAX_WAIT - waited)
             end
         end
 
@@ -260,18 +263,18 @@ If no pair is ready, the request is considered not served.
             continue
         end
 
-        isnothing(counters) || (counters[ready_key] += 1)
+        isnothing(counters) || (counters[Symbol("ready_$counter_suffix")] += 1)
 
         # Lock both endpoints before consuming. Lock ensure the slot is not modified by concurrent processes (e.g. swappers) while we check and consume it.
         @yield lock(q1.slot) & lock(q2.slot)
 
         # Remove reciprocal tags under lock to guarantee consistency.
-        t1 = querydelete!(q1.slot, EntanglementCounterpart, nodeB, q2.slot.idx)
-        t2 = querydelete!(q2.slot, EntanglementCounterpart, nodeA, q1.slot.idx)
+        t1 = querydelete!(q1.slot, EntanglementCounterpart, node_target, q2.slot.idx)
+        t2 = querydelete!(q2.slot, EntanglementCounterpart, node_query, q1.slot.idx)
         if isnothing(t1) || isnothing(t2)
             unlock(q1.slot)
             unlock(q2.slot)
-            isnothing(counters) || (counters[miss_changed_key] += 1)
+            isnothing(counters) || (counters[Symbol("miss_changed_$counter_suffix")] += 1)
             app_logs && @info("  -> [$label] Pair changed while locking - retry later.")
             continue
         end
@@ -281,8 +284,8 @@ If no pair is ready, the request is considered not served.
         t_obs = now(sim)
         F = real(observable((q1.slot, q2.slot), Φ⁺_DM; something=0.0, time=t_obs))
         F = clamp(F, 0.0, 1.0)
-        push!(fids, F)
-        isnothing(counters) || (counters[delivered_key] += 1)
+        push!(target_fids, F)
+        isnothing(counters) || (counters[Symbol("delivered_$counter_suffix")] += 1)
 
         app_logs && @info("  -> [$label] DELIVERED F = $(round(F, digits=4))")
 
@@ -313,10 +316,8 @@ function run_simulation(; duration::Float64=SIM_DURATION,
                           seed::Int=42,
                           verbose::Bool=true,
                           n_mem::Int=N_MEM,
-                          app_max_wait=APP_MAX_WAIT,
-                          app_wait_poll_dt=APP_WAIT_POLL_DT,
                           app_logs::Bool=false)
-    rng = MersenneTwister(seed)
+    rng_poisson = MersenneTwister(seed)
     net = build_dumbbell_net(n_mem=n_mem)
 
     # RegisterNet owns the underlying ConcurrentSim time tracker.
@@ -325,15 +326,15 @@ function run_simulation(; duration::Float64=SIM_DURATION,
     if verbose
         println("""
 +----------------------------------------------------------+
-| Dumbbell Quantum Network - ProtocolZoo version           |
+| Quantum Network Simulation                               |
 +----------------------------------------------------------+
-| BELL_RATE = $BELL_RATE pairs/s per link                  |
-| P_DEPOL   = $P_DEPOL                                     |
-| T2        = $T2 s                                        |
-| N_MEM     = $n_mem                                       |
-| APP_RATE  = $APP_RATE req/s per flow                     |
-| APP_WAIT  = $(isinf(app_max_wait) ? "Inf" : string(app_max_wait)) s                          |
-| SIM_TIME  = $duration s                                  |
+| BELL_RATE = $BELL_RATE pairs/s per link                  
+| P_DEPOL   = $P_DEPOL                                     
+| T2        = $T2 s                                        
+| N_MEM     = $n_mem                                       
+| APP_RATE  = $APP_RATE req/s per flow                     
+| APP_WAIT  = $APP_MAX_WAIT s                          
+| SIM_TIME  = $duration s                                  
 +----------------------------------------------------------+
 """)
     end
@@ -348,16 +349,17 @@ function run_simulation(; duration::Float64=SIM_DURATION,
                    (NODE_R1, NODE_R2),
                    (NODE_R2, NODE_C),
                    (NODE_R2, NODE_D)]
-
+        
+        # todo: capire per bene perchè con margin 3 funziona e con 2 no
         # one entangler process per physical link
         ent = EntanglerProt(sim, net, u, v;
                             rate=BELL_RATE,
                             pairstate=WERNER_PAIR,
                             success_prob=1.0,    # MOD: forza il successo del singolo attempt
                             randomize=true,      # MOD: riduce contese deterministiche sugli stessi slot
-                            margin=1,            # MOD: evita monopolio completo della memoria sul link
+                            margin=3,            # MOD: evita monopolio completo della memoria sul link
                             hardmargin=1,        # MOD: lascia sempre almeno 1 slot libero (anti-starvation)
-                            retry_lock_time=1e-4 # MOD: backoff breve quando non si riesce a lockare
+                            retry_lock_time=1e-3 # MOD: backoff breve quando non si riesce a lockare
                             )
         @process ent()
     end
@@ -367,19 +369,27 @@ function run_simulation(; duration::Float64=SIM_DURATION,
     # ------------------------------------------------------------
     # R1: combine links from {A,B} toward R2.
     # todo: consider adding NODE_C and NODE_D as possible nodeH for R1, to allow direct swapping from A/B to C/D at R1 when R2 is busy.
+    # * Lock contention warning: The entangler's aggressive retry interval starves the swapper, 
+    # * preventing it from acquiring the two simultaneous locks needed for an entanglement swap.
     swap_r1 = SwapperProt(sim, net, NODE_R1;
                           nodeL=(n -> n == NODE_A || n == NODE_B),
-                          nodeH=(n -> n == NODE_R2),
-                          retry_lock_time=1e-3)
+                          nodeH=(n -> n == NODE_R2), # MOD: allow R1 to swap directly toward C/D when R2 is busy
+                          retry_lock_time=1e-4)
 
     # R2: combine incoming entanglement from {R1,A,B} toward {C,D}.
-    swap_r2 = SwapperProt(sim, net, NODE_R2;
-                          nodeL=(n -> n == NODE_R1 || n == NODE_A || n == NODE_B), # R2 can be entangled both with R1 and directly with A/B due to swapping at R1
-                          nodeH=(n -> n == NODE_C || n == NODE_D),
-                          retry_lock_time=1e-3)
+    swap_r2_AC = SwapperProt(sim, net, NODE_R2;
+                          nodeL=(n -> n == NODE_A), # R2 can be entangled both with R1 and directly with A/B due to swapping at R1
+                          nodeH=(n -> n == NODE_C),
+                          retry_lock_time=1e-4)
+    
+    swap_r2_BD = SwapperProt(sim, net, NODE_R2;
+                          nodeL=(n -> n == NODE_B), # R2 can be entangled both with R1 and directly with A/B due to swapping at R1
+                          nodeH=(n -> n == NODE_D),
+                          retry_lock_time=1e-4)
 
     @process swap_r1()
-    @process swap_r2()
+    @process swap_r2_AC()
+    @process swap_r2_BD()
 
     # ------------------------------------------------------------
     # Metadata/correction tracking on all nodes
@@ -416,14 +426,10 @@ function run_simulation(; duration::Float64=SIM_DURATION,
     # Monitor to estimate where throughput is bottlenecked (generation vs swapping).
     @process monitor_pair_counters(sim, net, counters)
 
-    @process app_process(sim, net, NODE_A, NODE_C, "A-C", fids_ac, rng, counters,
-                         :delivered_AC, :requests_AC, :ready_AC,
-                         :miss_no_pair_AC, :miss_unsynced_AC, :miss_changed_AC,
-                         app_max_wait, app_wait_poll_dt, app_logs)
-    @process app_process(sim, net, NODE_B, NODE_D, "B-D", fids_bd, rng, counters,
-                         :delivered_BD, :requests_BD, :ready_BD,
-                         :miss_no_pair_BD, :miss_unsynced_BD, :miss_changed_BD,
-                         app_max_wait, app_wait_poll_dt, app_logs)
+    # Process for each target pair. They run independently and concurrently, generating Poisson requests at the same APP_RATE/2.
+    @process app_process(sim, net, "A-C", NODE_A, NODE_C, fids_ac, rng_poisson, counters, app_logs)
+    
+    @process app_process(sim, net, "B-D", NODE_B, NODE_D, fids_bd, rng_poisson, counters, app_logs)
 
     # Run event-driven simulation.
     run(sim, duration)
@@ -625,8 +631,6 @@ result = Base.invokelatest(run_simulation;
                            seed=42,
                            verbose=true,
                            n_mem=N_MEM,
-                           app_max_wait=APP_MAX_WAIT,
-                           app_wait_poll_dt=APP_WAIT_POLL_DT,
                            app_logs=true)
 
 # Uncomment to run depolarization sweep:

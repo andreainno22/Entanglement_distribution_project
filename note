@@ -1,0 +1,6 @@
+1) The lock contention issue arises because the entanglement generation process uses a significantly shorter lock-retry interval than the swapping process; consequently, whenever a memory slot becomes available, the entangler immediately seizes it to generate a new pair, continuously starving the swapper of the two simultaneous locks it requires to successfully perform an entanglement swap.
+
+2) The simulation suffered from a memory deadlock because the generic swapper at node R2 randomly combined incoming connections, creating unwanted 'garbage' pairs (A-D and B-C) that were never consumed by the application. To solve this, we implemented strict routing by deploying two dedicated swappers at R2, one restricted to A-C traffic and the other to B-D traffic, thereby eliminating cross-talk and preventing memory exhaustion.
+
+3) The simulation experienced a severe deadlock caused by a single application process waiting indefinitely for a specific target connection (e.g., A-C), which caused the limited memory slots to fill up completely with unrequested pairs (e.g., B-D). To solve this, we introduced separate, concurrent application processes for each flow, ensuring that every generated pair is consumed and cleared from memory as soon as it is ready.
+
